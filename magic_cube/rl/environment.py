@@ -23,6 +23,14 @@ from magic_cube.rl.observation import (
 )
 
 
+def recommended_max_steps(scramble_depth: int) -> int:
+    """Return a compact horizon that still allows a few corrective moves."""
+
+    if scramble_depth < 0:
+        raise ValueError("scramble_depth must be non-negative")
+    return max(4, scramble_depth * 2 + 4)
+
+
 class CubeEnv(gym.Env[np.ndarray, int]):
     """A local environment with clockwise and inverse quarter turns."""
 
@@ -35,19 +43,44 @@ class CubeEnv(gym.Env[np.ndarray, int]):
         max_steps: int | None = None,
         render_mode: str | None = None,
         reward_config: RewardConfig = DEFAULT_REWARD_CONFIG,
+        focus_depth: int | None = None,
+        focus_depth_probability: float = 0.0,
     ) -> None:
         super().__init__()
         if scramble_depth < 0:
             raise ValueError("scramble_depth must be non-negative")
         if min_scramble_depth is not None and not 0 <= min_scramble_depth <= scramble_depth:
             raise ValueError("min_scramble_depth must be between 0 and scramble_depth")
+        if max_steps is not None and max_steps <= 0:
+            raise ValueError("max_steps must be greater than zero")
+        if not 0.0 <= focus_depth_probability <= 1.0:
+            raise ValueError("focus_depth_probability must be between 0 and 1")
         self.scramble_depth = scramble_depth
         self.min_scramble_depth = (
             scramble_depth if min_scramble_depth is None else min_scramble_depth
         )
-        self.max_steps = max_steps or max(100, scramble_depth * 2 + 10)
+        self.max_steps = (
+            recommended_max_steps(scramble_depth)
+            if max_steps is None
+            else max_steps
+        )
         self.render_mode = render_mode
         self.reward_config = reward_config
+        if focus_depth is not None and not (
+            self.min_scramble_depth <= focus_depth <= self.scramble_depth
+        ):
+            raise ValueError("focus_depth must be within the scramble depth range")
+        if focus_depth is None and focus_depth_probability:
+            raise ValueError(
+                "focus_depth is required when focus_depth_probability is non-zero"
+            )
+        self.focus_depth = focus_depth
+        self.focus_depth_probability = focus_depth_probability
+        self._non_focus_depths = tuple(
+            depth
+            for depth in range(self.min_scramble_depth, self.scramble_depth + 1)
+            if depth != focus_depth
+        )
         self.action_space = spaces.Discrete(len(MOVE_ORDER))
         self.observation_space = spaces.Box(
             low=0.0,
@@ -61,6 +94,17 @@ class CubeEnv(gym.Env[np.ndarray, int]):
         self.redundant_actions = 0
         self.scramble = tuple()
 
+    def _sample_scramble_depth(self, random_source: random.Random) -> int:
+        if self.focus_depth is None or self.focus_depth_probability == 0.0:
+            return random_source.randint(self.min_scramble_depth, self.scramble_depth)
+        if (
+            self.focus_depth_probability == 1.0
+            or not self._non_focus_depths
+            or random_source.random() < self.focus_depth_probability
+        ):
+            return self.focus_depth
+        return random_source.choice(self._non_focus_depths)
+
     def _observation(self) -> np.ndarray:
         return encode_model_observation(self.state, self.history)
 
@@ -72,9 +116,7 @@ class CubeEnv(gym.Env[np.ndarray, int]):
     ) -> tuple[np.ndarray, dict[str, Any]]:
         super().reset(seed=seed)
         random_source = random.Random(seed) if seed is not None else random.Random()
-        selected_depth = random_source.randint(
-            self.min_scramble_depth, self.scramble_depth
-        )
+        selected_depth = self._sample_scramble_depth(random_source)
         self.state, scramble = CubeState.scrambled(selected_depth, rng=random_source)
         self.scramble = scramble.moves
         self.history.clear()

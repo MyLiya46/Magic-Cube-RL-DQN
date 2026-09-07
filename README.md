@@ -37,6 +37,12 @@ uv run python scripts/evaluate_rl.py --checkpoint models/cube_solver.zip --episo
 uv run python scripts/train_rl.py --depths 10,20 --target-success-rate 0.80 --max-redundancy-rate 0.05
 ```
 
+暴力
+
+```bash
+uv run python scripts/train_rl.py --depths 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20 --target-success-rate 0.90 --max-redundancy-rate 0.05
+```
+
 训练策略：
 
 - 深度 `N` 阶段从 `1..N` 步打乱中采样，保留之前深度的能力。

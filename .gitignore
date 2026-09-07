@@ -7,6 +7,6 @@ __pycache__/
 # Training artifacts are local and can be hundreds of megabytes.  Keep the
 # model contract/documentation in Git, but never commit generated weights.
 
-models/*.pkl
+# models/*.pkl
 # models/*.zip
 # models/curriculum_progress.json

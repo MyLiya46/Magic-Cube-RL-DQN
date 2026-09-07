@@ -15,9 +15,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from magic_cube.core.moves import MOVE_ORDER
+import numpy as np
+
+from magic_cube.core.moves import MOVE_ORDER, MOVE_TO_INDEX, coerce_move
 from magic_cube.rl.action_rules import DEFAULT_REWARD_CONFIG
-from magic_cube.rl.environment import CubeEnv
+from magic_cube.rl.environment import CubeEnv, recommended_max_steps
 from magic_cube.rl.evaluation import EvaluationResult, evaluate_model
 from magic_cube.rl.observation import MODEL_OBSERVATION_SIZE, MODEL_SCHEMA_VERSION
 
@@ -70,7 +72,24 @@ def parse_args() -> argparse.Namespace:
         help="达到目标成功率的此比例后，恢复最短验证间隔",
     )
     parser.add_argument("--max-timesteps-per-depth", type=int, default=5_000_000)
-    parser.add_argument("--max-episode-steps", type=int, default=100)
+    parser.add_argument(
+        "--max-episode-steps",
+        type=int,
+        default=None,
+        help="每回合最大步数；默认按深度使用 2*N+4",
+    )
+    parser.add_argument(
+        "--current-depth-probability",
+        type=float,
+        default=0.75,
+        help="训练时采样当前课程深度的概率",
+    )
+    parser.add_argument(
+        "--expert-episodes",
+        type=int,
+        default=2_000,
+        help="经验池为空时，用已知逆序解预填充的专家回合数",
+    )
     parser.add_argument("--models-dir", type=Path, default=Path("models"))
     parser.add_argument("--resume-from", type=Path)
     parser.add_argument("--seed", type=int, default=7)
@@ -92,10 +111,15 @@ def validate_args(args: argparse.Namespace) -> None:
         "initial_train_steps_per_round",
         "train_steps_per_round",
         "max_timesteps_per_depth",
-        "max_episode_steps",
     ):
         if getattr(args, name) <= 0:
             raise SystemExit(f"--{name.replace('_', '-')} 必须大于 0")
+    if args.max_episode_steps is not None and args.max_episode_steps <= 0:
+        raise SystemExit("--max-episode-steps 必须大于 0")
+    if not 0.0 <= args.current_depth_probability <= 1.0:
+        raise SystemExit("--current-depth-probability 必须在 [0, 1] 范围内")
+    if args.expert_episodes < 0:
+        raise SystemExit("--expert-episodes 不能小于 0")
     if args.eval_interval_growth <= 1.0:
         raise SystemExit("--eval-interval-growth 必须大于 1")
     if not 0.0 < args.near_target_ratio <= 1.0:
@@ -122,6 +146,62 @@ def create_model(env: CubeEnv, seed: int):
         policy_kwargs={"net_arch": [512, 512, 256]},
         seed=seed,
     )
+
+
+def replay_buffer_path(checkpoint: Path) -> Path:
+    """Return the ignored sidecar path used for an SB3 replay buffer."""
+
+    return checkpoint.with_suffix(".replay.pkl")
+
+
+def load_checkpoint(model_class: Any, checkpoint: Path, *, env: CubeEnv | None = None):
+    """Load a model and restore its replay buffer when a sidecar exists."""
+
+    model = model_class.load(str(checkpoint), env=env, device="auto")
+    buffer_path = replay_buffer_path(checkpoint)
+    if buffer_path.exists():
+        model.load_replay_buffer(str(buffer_path))
+        print(f"恢复经验池：{buffer_path}")
+    return model
+
+
+def save_training_checkpoint(model: Any, checkpoint: Path) -> None:
+    """Save model weights and the replay buffer needed for true continuation."""
+
+    model.save(str(checkpoint.with_suffix("")))
+    model.save_replay_buffer(str(replay_buffer_path(checkpoint)))
+
+
+def prefill_expert_replay(model: Any, env: CubeEnv, episodes: int, seed: int) -> int:
+    """Add known inverse-scramble trajectories to an empty replay buffer."""
+
+    replay_buffer = getattr(model, "replay_buffer", None)
+    if replay_buffer is None or episodes <= 0 or replay_buffer.size() != 0:
+        return 0
+
+    added = 0
+    for episode in range(episodes):
+        observation, info = env.reset(seed=seed + episode)
+        scramble = tuple(coerce_move(move) for move in info["scramble"])
+        solution = tuple(move.inverse for move in reversed(scramble))
+        for move in solution:
+            action = MOVE_TO_INDEX[move]
+            next_observation, reward, terminated, truncated, _step_info = env.step(
+                action
+            )
+            replay_buffer.add(
+                np.asarray(observation, dtype=np.float32)[None, :],
+                np.asarray(next_observation, dtype=np.float32)[None, :],
+                np.asarray([action], dtype=np.int64),
+                np.asarray([reward], dtype=np.float32),
+                np.asarray([terminated or truncated], dtype=bool),
+                [{"TimeLimit.truncated": truncated}],
+            )
+            added += 1
+            observation = next_observation
+            if terminated or truncated:
+                break
+    return added
 
 
 def find_previous_checkpoint(models_dir: Path, before_depth: int) -> Path | None:
@@ -225,19 +305,32 @@ def main() -> None:
         "maximum_redundancy_rate": args.max_redundancy_rate,
         "evaluation_episodes": args.eval_episodes,
     }
+    progress["training_config"] = {
+        "current_depth_probability": args.current_depth_probability,
+        "expert_episodes": args.expert_episodes,
+        "max_episode_steps": args.max_episode_steps,
+        "horizon_strategy": "2*N+4" if args.max_episode_steps is None else "fixed",
+    }
     model = None
 
     if args.resume_from is not None:
         if not args.resume_from.exists():
             raise SystemExit(f"续训模型不存在：{args.resume_from}")
-        model = DQN.load(str(args.resume_from), device="auto")
+        model = load_checkpoint(DQN, args.resume_from)
         print(f"从模型继续训练：{args.resume_from}")
 
     for depth in args.depths:
+        max_episode_steps = (
+            recommended_max_steps(depth)
+            if args.max_episode_steps is None
+            else args.max_episode_steps
+        )
         train_env = CubeEnv(
             scramble_depth=depth,
             min_scramble_depth=1,
-            max_steps=args.max_episode_steps,
+            max_steps=max_episode_steps,
+            focus_depth=depth,
+            focus_depth_probability=args.current_depth_probability,
         )
         qualified_path = args.models_dir / f"cube_dqn_depth_{depth}.zip"
         latest_path = args.models_dir / f"cube_dqn_depth_{depth}_latest.zip"
@@ -247,12 +340,12 @@ def main() -> None:
         initial_result: EvaluationResult | None = None
 
         if qualified_path.exists() and not args.force_retrain:
-            candidate = DQN.load(str(qualified_path), env=train_env, device="auto")
+            candidate = load_checkpoint(DQN, qualified_path, env=train_env)
             existing_result = evaluate_model(
                 candidate,
                 scramble_depth=depth,
                 episodes=args.eval_episodes,
-                max_steps=args.max_episode_steps,
+                max_steps=max_episode_steps,
                 seed=args.seed + depth * 10_000,
             )
             print_evaluation(depth, 0, existing_result)
@@ -274,14 +367,14 @@ def main() -> None:
             initial_result = existing_result
 
         if latest_path.exists() and not args.force_retrain:
-            model = DQN.load(str(latest_path), env=train_env, device="auto")
+            model = load_checkpoint(DQN, latest_path, env=train_env)
             initial_result = None
             print(f"自动继续未达标阶段：{latest_path}")
 
         if model is None:
             previous = find_previous_checkpoint(args.models_dir, depth)
             if previous is not None:
-                model = DQN.load(str(previous), env=train_env, device="auto")
+                model = load_checkpoint(DQN, previous, env=train_env)
                 print(f"自动继承上一阶段模型：{previous}")
             else:
                 model = create_model(train_env, args.seed)
@@ -295,7 +388,7 @@ def main() -> None:
                 model,
                 scramble_depth=depth,
                 episodes=args.eval_episodes,
-                max_steps=args.max_episode_steps,
+                max_steps=max_episode_steps,
                 seed=args.seed + depth * 10_000,
             )
             print_evaluation(depth, stage_timesteps, initial_result)
@@ -310,11 +403,20 @@ def main() -> None:
             qualified=qualified,
         )
         if qualified:
-            model.save(str(qualified_path.with_suffix("")))
+            save_training_checkpoint(model, qualified_path)
             model.save(str(args.models_dir / "cube_solver"))
             train_env.close()
             print(f"深度 {depth} 无需追加训练，已保存：{qualified_path}")
             continue
+
+        expert_transitions = prefill_expert_replay(
+            model,
+            train_env,
+            args.expert_episodes,
+            seed=args.seed + depth * 100_000,
+        )
+        if expert_transitions:
+            print(f"专家轨迹预填充：{expert_transitions} 条经验。")
 
         scheduled_round_steps = min(
             args.initial_train_steps_per_round,
@@ -331,11 +433,11 @@ def main() -> None:
                 model,
                 scramble_depth=depth,
                 episodes=args.eval_episodes,
-                max_steps=args.max_episode_steps,
+                max_steps=max_episode_steps,
                 seed=args.seed + depth * 10_000,
             )
             print_evaluation(depth, stage_timesteps, result)
-            model.save(str(latest_path.with_suffix("")))
+            save_training_checkpoint(model, latest_path)
             qualified = is_qualified(result, args)
             total_stage_timesteps = previous_stage_steps + stage_timesteps
             save_progress(
@@ -347,7 +449,7 @@ def main() -> None:
                 qualified=qualified,
             )
             if qualified:
-                model.save(str(qualified_path.with_suffix("")))
+                save_training_checkpoint(model, qualified_path)
                 model.save(str(args.models_dir / "cube_solver"))
                 print(f"深度 {depth} 达到目标，已保存：{qualified_path}")
                 break
